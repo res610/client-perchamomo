@@ -8,6 +8,8 @@ on:
 
 permissions:
     contents: write
+    issues: write
+    actions: write
 
 concurrency:
     group: "instagram-fetch"
@@ -18,12 +20,16 @@ jobs:
         runs-on: ubuntu-latest
         steps:
             - name: Checkout
-              uses: actions/checkout@v4
+              uses: actions/checkout@v5
 
             - name: Setup Node
-              uses: actions/setup-node@v4
+              uses: actions/setup-node@v5
               with:
                   node-version: '22'
+                  cache: npm
+
+            - name: Install dependencies
+              run: npm ci
 
             - name: Refresh Instagram token
               env:
@@ -35,9 +41,15 @@ jobs:
                   RESPONSE=$(curl -s "https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${INSTAGRAM_ACCESS_TOKEN}")
                   NEW_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token // empty')
                   if [ -n "$NEW_TOKEN" ]; then
+                      echo "::add-mask::$NEW_TOKEN"
                       echo "Token refreshed successfully."
-                      # Update GitHub Secret with new token
-                      gh secret set INSTAGRAM_ACCESS_TOKEN --body "$NEW_TOKEN"
+                      # Update GitHub Secret with new token.
+                      # 失敗してもジョブは止めない（投稿取得を優先。Secretsの旧トークンも自身の期限までは有効）
+                      if gh secret set INSTAGRAM_ACCESS_TOKEN --body "$NEW_TOKEN"; then
+                          echo "GitHub Secret updated."
+                      else
+                          echo "::warning::INSTAGRAM_ACCESS_TOKEN の Secret 更新に失敗しました。GH_PAT_TOKEN の有効期限・repoスコープを確認してください。今回の実行はリフレッシュ済みトークンで続行します。"
+                      fi
                       echo "INSTAGRAM_ACCESS_TOKEN=$NEW_TOKEN" >> "$GITHUB_ENV"
                   else
                       echo "Token refresh skipped or failed (may be less than 24h old): $RESPONSE"
@@ -68,3 +80,30 @@ jobs:
                   git config user.email "github-actions[bot]@users.noreply.github.com"
                   git commit -m "chore: update Instagram feed data"
                   git push
+
+            # GITHUB_TOKENによるpushはpushトリガーを起動しないため、デプロイを明示的に起動する
+            - name: Trigger deploy
+              if: steps.changes.outputs.changed == 'true'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: gh workflow run deploy.yml --ref main
+
+            # 失敗が放置されないよう、失敗時はIssueで通知（既存のオープンIssueがあれば重複作成しない）
+            - name: Notify failure via issue
+              if: failure()
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  EXISTING=$(gh issue list --state open --search "Instagram自動取得が失敗しています in:title" --json number --jq 'length')
+                  if [ "$EXISTING" -eq 0 ]; then
+                      BODY=$(printf '%s\n' \
+                          "fetch-instagram ワークフローが失敗しました。実行ログ: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+                          "" \
+                          "よくある原因:" \
+                          "- GH_PAT_TOKEN の有効期限切れ（Secret更新の403エラー）" \
+                          "- INSTAGRAM_ACCESS_TOKEN の失効（code 190 → 手動再発行が必要）" \
+                          "- Secrets未設定（INSTAGRAM_ACCESS_TOKEN / INSTAGRAM_USER_ID）")
+                      gh issue create --title "Instagram自動取得が失敗しています" --body "$BODY"
+                  else
+                      echo "Open notification issue already exists. Skipping."
+                  fi
